@@ -4,7 +4,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { extractLabel, summarizeInteraction } from './groq.js';
 import { fetchInteractionText } from './firecrawl.js';
-import { curatedInteraction } from './curated.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -42,7 +41,8 @@ app.post('/api/scan', async (req, res) => {
 
 // ---- Check a single drug pair ----
 // Body: { drugA, drugB }
-// Strategy: live Firecrawl + Gemini first; curated fallback on any failure.
+// Strategy: resolve the specific pairwise page live via Firecrawl, then Groq
+// rewrites it into plain English + severity. No hardcoded answers.
 app.post('/api/interaction', async (req, res) => {
   const { drugA, drugB } = req.body || {};
   if (!drugA || !drugB) return res.status(400).json({ error: 'Need drugA and drugB' });
@@ -80,8 +80,9 @@ const pairs = [];
 });
 
 /**
- * Core resolution: try live (Firecrawl -> Gemini), fall back to curated, then to
- * a safe "unknown/yellow" so the UI always gets a usable answer.
+ * Core resolution: resolve the specific pairwise page live (Firecrawl -> Groq).
+ * A genuine "no interaction listed" becomes green; a live failure becomes an
+ * honest "unknown/yellow" rather than a canned answer.
  */
 const interactionCache = new Map();
 const pairKey = (a, b) => [a, b].map((d) => d.trim().toLowerCase()).sort().join('|');
@@ -90,32 +91,52 @@ async function resolveInteraction(drugA, drugB) {
   const key = pairKey(drugA, drugB);
   if (interactionCache.has(key)) return interactionCache.get(key);
   const result = await computeInteraction(drugA, drugB);
-  if (result.source === 'live' || result.source === 'curated') {
+  if (result.source === 'live') {
     interactionCache.set(key, result);
   }
   return result;
 }
 
-async function computeInteraction(drugA, drugB) {
-  if (process.env.FIRECRAWL_API_KEY && process.env.GROQ_API_KEY) {
-    try {
-      const { text, sourceUrl } = await fetchInteractionText(drugA, drugB);
-      if (text && text.length > 80) {
-        const summary = await summarizeInteraction(drugA, drugB, text);
-        return { ...summary, source: 'live', sourceUrl };
-      }
-    } catch (err) {
-      console.warn(`[interaction] ${drugA}+${drugB} live failed:`, err.message);
-    }
-  }
-  const curated = curatedInteraction(drugA, drugB);
-  if (curated) return { ...curated, source: 'curated' };
+function unknownResult(drugA, drugB) {
   return {
     severity: 'yellow',
-    summary: `No interaction data could be retrieved for ${drugA} and ${drugB}.`,
-    action: 'Confirm with a pharmacist before combining.',
+    summary: `We couldn't retrieve interaction data for ${drugA} and ${drugB} right now.`,
+    action: 'Confirm with a pharmacist before combining them.',
     source: 'unknown',
   };
+}
+
+async function computeInteraction(drugA, drugB) {
+  if (!process.env.FIRECRAWL_API_KEY || !process.env.GROQ_API_KEY) {
+    return unknownResult(drugA, drugB);
+  }
+  try {
+    const result = await fetchInteractionText(drugA, drugB);
+
+    // drugB never appears on drugA's interaction index (or vice versa):
+    // Drugs.com lists no known interaction — a genuine "all clear".
+    if (result.noInteractionListed) {
+      return {
+        severity: 'green',
+        summary: `Drugs.com lists no known interaction between ${drugA} and ${drugB}.`,
+        action: 'No special action needed, but tell your pharmacist about everything you take.',
+        source: 'live',
+        sourceUrl: result.sourceUrl,
+      };
+    }
+
+    // Resolved to the specific pairwise page — let Groq summarize its content.
+    if (result.resolved && result.text && result.text.length > 80) {
+      const summary = await summarizeInteraction(drugA, drugB, result.text);
+      return { ...summary, source: 'live', sourceUrl: result.sourceUrl };
+    }
+
+    // Live path returned nothing usable — be honest rather than guess.
+    return unknownResult(drugA, drugB);
+  } catch (err) {
+    console.warn(`[interaction] ${drugA}+${drugB} live failed:`, err.message);
+    return unknownResult(drugA, drugB);
+  }
 }
 
 // ---- Serve the built frontend (single Cloud Run service) ----
